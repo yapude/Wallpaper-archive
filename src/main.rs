@@ -4,7 +4,7 @@ mod wallpaperflare;
 use std::collections::HashSet;
 use std::path::Path;
 
-const CDN_BASE: &str = "https://raw.githubusercontent.com/yapude/Wallpaper-archive/main/assets";
+const CDN_BASE: &str = "https://raw.githubusercontent.com/yapude/wallpapers/main/assets";
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -66,6 +66,36 @@ fn print_stats(stats: &Stats, md_file: &str) {
         "[stats] downloaded: {} | skipped: {} | failed: {} | pushes: {} | active readme: {} lines | local disk: {}",
         dl, skip, fail, pushes, readme_lines, disk
     );
+}
+
+// fetches a readme from the upstream yapude/wallpapers repo via raw.githubusercontent.com
+// saves it locally so load_existing_ids can parse the slugs out and skip any wallpaper
+// that was already archived in the original repo, preventing duplicate downloads
+async fn download_upstream_readme(client: &wreq::Client, remote_name: &str, local_name: &str) -> Result<(), String> {
+    let url = format!(
+        "https://raw.githubusercontent.com/yapude/wallpapers/main/{}",
+        remote_name
+    );
+    println!("[upstream] downloading {} -> {} ...", url, local_name);
+
+    let response = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("failed to fetch {}: {}", remote_name, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("http {} for {}", response.status(), remote_name));
+    }
+
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    std::fs::write(local_name, &body)
+        .map_err(|e| format!("failed to write {}: {}", local_name, e))?;
+
+    let lines = body.lines().count();
+    println!("[upstream] saved {} ({} lines)", local_name, lines);
+    Ok(())
 }
 
 #[tokio::main]
@@ -208,6 +238,18 @@ async fn main() {
         }
     };
 
+    // pull readme.md and readme2.md from the original wallpapers repo before scraping starts
+    // these files contain every previously archived wallpaper slug, so load_existing_ids
+    // can build a complete dedup set and skip anything already in the upstream index.
+    // saved as _upstream_* to avoid clobbering the new repo's own readme
+    let upstream_readmes = [("README.md", "_upstream_readme.md"), ("README2.md", "_upstream_readme2.md")];
+    for (remote, local) in &upstream_readmes {
+        match download_upstream_readme(&shared_client, remote, local).await {
+            Ok(()) => {}
+            Err(e) => println!("[upstream] warning: could not download {}: {}", remote, e),
+        }
+    }
+
     let mut tasks = Vec::new();
     for tag in flare_tags {
         let sem = dl_semaphore.clone();
@@ -217,7 +259,7 @@ async fn main() {
         let tag = tag.to_string();
         let client = shared_client.clone();
         tasks.push(tokio::spawn(async move {
-            scrape_source(client, "assets", &["README.md", "README2.md"], "README2.md", Some(&tag), u32::MAX, sem, mtx, u_count, s).await;
+            scrape_source(client, "assets", &["_upstream_readme.md", "_upstream_readme2.md", "README3.md"], "README3.md", Some(&tag), u32::MAX, sem, mtx, u_count, s).await;
         }));
     }
 
@@ -226,7 +268,7 @@ async fn main() {
 
     if std::env::var("GITHUB_ACTIONS").is_ok() {
         let _ = std::fs::remove_file(".git/index.lock");
-        let _ = tokio::process::Command::new("git").args(["add", "--ignore-removal", "--sparse", "README.md", "README2.md", "assets"])
+        let _ = tokio::process::Command::new("git").args(["add", "--ignore-removal", "--sparse", "README3.md", "assets"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().await;
         let _ = tokio::process::Command::new("git").args(["commit", "-m", "chore: sort readme alphabetically [skip ci]"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().await;
@@ -411,7 +453,7 @@ async fn scrape_source(
                             let _freeze = dl_semaphore.acquire_many(30).await.unwrap();
                             
                             let _ = std::fs::remove_file(".git/index.lock");
-                            let _ = tokio::process::Command::new("git").args(["add", "--ignore-removal", "--sparse", "README.md", "README2.md", "assets"])
+                            let _ = tokio::process::Command::new("git").args(["add", "--ignore-removal", "--sparse", "README3.md", "assets"])
                                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().await;
                             let _ = tokio::process::Command::new("git").args(["commit", "-m", "chore: archive batch of new wallpapers [skip ci]"])
                                 .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().await;
